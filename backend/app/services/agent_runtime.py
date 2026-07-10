@@ -11,13 +11,14 @@ Runtime 位于 ChatService 之下、Planner/Executor 之上。
 但 Runtime 不自己制定新计划。
 """
 
-from app.executors.base_executor import BaseExecutor, ExecutionContext
+from app.executors.base_executor import BaseExecutor
 from app.executors import llm_executor as llm_executor_module
 from app.executors import memory_executor as memory_executor_module
 from app.executors import tool_executor as tool_executor_module
 from app.executors.llm_executor import llm_executor
 from app.executors.memory_executor import memory_executor
 from app.executors.tool_executor import tool_executor
+from app.services.agent_context import AgentContext
 from app.services.memory_extractor_service import memory_extractor_service
 from app.services.memory_service import memory_service
 from app.services.model_service import model_service
@@ -36,7 +37,7 @@ class AgentRuntime:
     职责：
     - 调用 PlannerService 生成执行计划
     - 按 Plan 调度对应 Executor
-    - 维护一轮执行的 ExecutionContext
+    - 创建并推进 AgentContext
     - 构建本轮 Observation
     - 调用 ReflectionService 评价本轮结果
     - 在最大次数内执行 RePlan
@@ -80,116 +81,104 @@ class AgentRuntime:
             助手回复内容和本轮 Agent 执行调试信息。
         """
         plan = planner_service.plan(message)
+        agent_context = AgentContext(session_id=session_id, user_input=message)
+        agent_context.current_plan = plan
         self._sync_executor_dependencies()
 
-        context: ExecutionContext | None = None
         tool_trace: ToolTrace | None = None
-        observation: Observation | None = None
-        reflection_result = None
 
         for iteration in range(self.max_iterations):
-            context = self._create_context(message, session_id, context)
-            context, tool_trace, observation, reflection_result = await self._execute_plan(
+            agent_context.iteration_count = iteration + 1
+            agent_context.current_plan = plan
+            tool_trace = await self._execute_plan(
                 plan,
-                context,
-                message,
+                agent_context,
             )
 
-            if reflection_result.status == "success":
+            if agent_context.reflection is None:
+                break
+
+            if agent_context.reflection.status == "success":
                 break
 
             if (
-                reflection_result.should_replan
+                agent_context.reflection.should_replan
                 and iteration < self.max_iterations - 1
                 and hasattr(planner_service, "create_replan")
             ):
-                plan = planner_service.create_replan(reflection_result)
+                plan = planner_service.create_replan(agent_context.reflection)
+                agent_context.current_plan = plan
                 continue
 
             break
 
-        if context is None or tool_trace is None or observation is None or reflection_result is None:
-            context = ExecutionContext(message=message, session_id=session_id)
+        if (
+            tool_trace is None
+            or agent_context.observation is None
+            or agent_context.reflection is None
+        ):
             tool_trace = self._default_tool_trace(message)
-            observation = self._build_observation(context, tool_trace)
-            reflection_result = reflection_service.reflect(observation)
+            agent_context.observation = self._build_observation(agent_context, tool_trace)
+            agent_context.reflection = reflection_service.reflect(agent_context.observation)
 
         debug = {
             "used_tool": tool_trace.used_tool,
             "tool_name": tool_trace.tool_name,
-            "tool_result": context.tool_result,
+            "tool_result": self._latest_tool_result(agent_context),
             "tool_success": tool_trace.success,
             "tool_error": tool_trace.error,
             "tool_metadata": tool_trace.metadata,
             "session_id": session_id,
-            "recent_messages_count": len(context.recent_messages),
-            "long_term_facts_count": len(context.long_term_facts),
-            "prompt_messages_count": observation.prompt_messages_count,
-            "has_tool_context": context.tool_result is not None,
-            "reflection_status": reflection_result.status,
-            "reflection_reason": reflection_result.reason,
-            "should_replan": reflection_result.should_replan,
+            "recent_messages_count": len(agent_context.recent_messages),
+            "long_term_facts_count": len(agent_context.long_term_facts),
+            "prompt_messages_count": agent_context.observation.prompt_messages_count,
+            "has_tool_context": self._latest_tool_result(agent_context) is not None,
+            "reflection_status": agent_context.reflection.status,
+            "reflection_reason": agent_context.reflection.reason,
+            "should_replan": agent_context.reflection.should_replan,
         }
-        memory_service.save_conversation(session_id, message, context.reply)
+        memory_service.save_conversation(session_id, message, agent_context.final_reply)
         extracted_facts = await memory_extractor_service.extract_facts(message)
         memory_service.save_long_term_facts(session_id, extracted_facts)
         debug["extracted_facts_count"] = len(extracted_facts)
         debug["extracted_facts"] = extracted_facts
-        return context.reply, debug
+        return agent_context.final_reply, debug
 
     async def _execute_plan(
         self,
         plan,
-        context: ExecutionContext,
-        message: str,
-    ) -> tuple[ExecutionContext, ToolTrace, Observation, object]:
+        agent_context: AgentContext,
+    ) -> ToolTrace:
         """
         执行一个 Plan，并返回执行后的观察和评价。
 
         Args:
             plan: Planner 生成的执行计划。
-            context: 本轮执行上下文。
-            message: 用户本轮输入。
+            agent_context: 本轮 Agent Run 的生命周期状态。
 
         Returns:
-            执行上下文、工具轨迹、观察结果和评价结果。
+            本轮执行中的工具轨迹，没有工具时返回默认 trace。
         """
+        start_trace_count = len(agent_context.tool_traces)
+
         # Runtime 只调度 Step，具体执行细节交给对应 Executor。
         for step in plan.steps:
+            agent_context.current_step = step
             executor = self.executors.get(step.step_type)
             if executor is not None:
-                await executor.execute(step, context)
+                await executor.execute(step, agent_context)
 
-        tool_trace = context.tool_trace or self._default_tool_trace(message)
-        observation = self._build_observation(context, tool_trace)
+        new_tool_traces = agent_context.tool_traces[start_trace_count:]
+        tool_trace = (
+            new_tool_traces[-1]
+            if new_tool_traces
+            else self._default_tool_trace(agent_context.user_input)
+        )
+        observation = self._build_observation(agent_context, tool_trace)
         reflection_result = reflection_service.reflect(observation)
-        return context, tool_trace, observation, reflection_result
-
-    def _create_context(
-        self,
-        message: str,
-        session_id: str,
-        previous_context: ExecutionContext | None,
-    ) -> ExecutionContext:
-        """
-        创建一次 Plan 执行使用的上下文。
-
-        Args:
-            message: 用户本轮输入。
-            session_id: 会话标识。
-            previous_context: 上一次执行留下的上下文。
-
-        Returns:
-            新的执行上下文。
-        """
-        context = ExecutionContext(message=message, session_id=session_id)
-        if previous_context is None:
-            return context
-
-        context.recent_messages = previous_context.recent_messages
-        context.long_term_facts = previous_context.long_term_facts
-        context.tool_result = previous_context.tool_result
-        return context
+        agent_context.observation = observation
+        agent_context.reflection = reflection_result
+        return tool_trace
 
     def _default_tool_trace(self, message: str) -> ToolTrace:
         """
@@ -212,14 +201,14 @@ class AgentRuntime:
 
     def _build_observation(
         self,
-        context: ExecutionContext,
+        context: AgentContext,
         tool_trace: ToolTrace,
     ) -> Observation:
         """
         根据执行上下文构建 Observation。
 
         Args:
-            context: 本轮 Agent 执行共享上下文。
+            context: 本轮 Agent Run 的共享状态。
             tool_trace: 本轮工具调用轨迹，没有工具时使用默认 trace。
 
         Returns:
@@ -228,11 +217,12 @@ class AgentRuntime:
         tool_results = []
         execution_errors = []
 
-        if context.tool_result is not None:
+        latest_tool_result = self._latest_tool_result(context)
+        if latest_tool_result is not None:
             tool_results.append(
                 {
                     "tool_name": tool_trace.tool_name,
-                    "content": context.tool_result,
+                    "content": latest_tool_result,
                     "success": tool_trace.success,
                 }
             )
@@ -241,12 +231,28 @@ class AgentRuntime:
             execution_errors.append(tool_trace.error)
 
         return Observation(
-            final_reply=context.reply,
+            final_reply=context.final_reply,
             tool_results=tool_results,
             execution_errors=execution_errors,
             prompt_messages_count=len(context.messages),
             memory_used=bool(context.recent_messages or context.long_term_facts),
         )
+
+    def _latest_tool_result(self, context: AgentContext) -> str | None:
+        """
+        获取最近一次工具结果文本。
+
+        Args:
+            context: 本轮 Agent Run 的共享状态。
+
+        Returns:
+            最近一次工具结果文本，没有工具结果时返回 None。
+        """
+        if not context.tool_results:
+            return None
+
+        content = context.tool_results[-1].get("content")
+        return content if isinstance(content, str) else None
 
     def _sync_executor_dependencies(self) -> None:
         """

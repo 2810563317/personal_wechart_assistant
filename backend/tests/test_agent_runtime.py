@@ -1,9 +1,17 @@
 import asyncio
 
-from app.executors.base_executor import ExecutionContext
+from app.services.agent_context import AgentContext
 from app.services.agent_runtime import AgentRuntime
 from app.services.planner_service import Plan, PlanStep, PlanStepType
 from app.tools.tool_trace import ToolTrace
+
+
+class SpyAgentContext(AgentContext):
+    instances: list["SpyAgentContext"] = []
+
+    def __init__(self, session_id: str, user_input: str) -> None:
+        super().__init__(session_id=session_id, user_input=user_input)
+        self.instances.append(self)
 
 
 class FakePlannerService:
@@ -27,9 +35,9 @@ class FakeExecutor:
         self.tool_success = tool_success
         self.calls: list[tuple[str, str | None, str, str]] = []
 
-    async def execute(self, step: PlanStep, context: ExecutionContext) -> None:
+    async def execute(self, step: PlanStep, context: AgentContext) -> None:
         self.calls.append(
-            (step.step_type, step.name, context.message, context.session_id)
+            (step.step_type, step.name, context.user_input, context.session_id)
         )
 
         if self.name == "memory":
@@ -47,34 +55,53 @@ class FakeExecutor:
                     }
                 ]
         elif self.name == "tool" and self.tool_success:
-            context.tool_result = "北京当前晴，气温 30℃。"
-            context.tool_trace = ToolTrace(
-                used_tool=True,
-                tool_name="weather",
-                success=True,
-                input=context.message,
-                output=context.tool_result,
-                error=None,
-                metadata={"city": "北京", "provider": "hfweather"},
+            tool_result = "北京当前晴，气温 30℃。"
+            context.tool_results.append(
+                {
+                    "tool_name": "weather",
+                    "content": tool_result,
+                    "success": True,
+                }
+            )
+            context.tool_traces.append(
+                ToolTrace(
+                    used_tool=True,
+                    tool_name="weather",
+                    success=True,
+                    input=context.user_input,
+                    output=tool_result,
+                    error=None,
+                    metadata={"city": "北京", "provider": "hfweather"},
+                )
             )
         elif self.name == "tool":
-            context.tool_result = "工具暂时不可用，请稍后再试。"
-            context.tool_trace = ToolTrace(
-                used_tool=True,
-                tool_name="weather",
-                success=False,
-                input=context.message,
-                output=None,
-                error="weather api error",
-                metadata={"error": "weather api error"},
+            tool_result = "工具暂时不可用，请稍后再试。"
+            context.tool_results.append(
+                {
+                    "tool_name": "weather",
+                    "content": tool_result,
+                    "success": False,
+                }
             )
+            context.tool_traces.append(
+                ToolTrace(
+                    used_tool=True,
+                    tool_name="weather",
+                    success=False,
+                    input=context.user_input,
+                    output=None,
+                    error="weather api error",
+                    metadata={"error": "weather api error"},
+                )
+            )
+            context.execution_errors.append("weather api error")
         elif self.name == "llm":
             context.messages = [
                 {"role": "system", "content": "system"},
                 *context.recent_messages,
-                {"role": "user", "content": context.message},
+                {"role": "user", "content": context.user_input},
             ]
-            context.reply = f"reply with {len(context.messages)} messages"
+            context.final_reply = f"reply with {len(context.messages)} messages"
 
 
 class FakeMemoryService:
@@ -308,3 +335,32 @@ def test_agent_runtime_replans_with_llm_only_plan_when_tool_execution_failed(
     assert debug["reflection_status"] == "success"
     assert debug["reflection_reason"] is None
     assert debug["should_replan"] is False
+
+
+def test_agent_runtime_updates_agent_context_lifecycle_state(monkeypatch) -> None:
+    SpyAgentContext.instances = []
+    monkeypatch.setattr("app.services.agent_runtime.AgentContext", SpyAgentContext)
+    (
+        runtime,
+        _fake_planner_service,
+        _fake_memory_executor,
+        _fake_tool_executor,
+        _fake_llm_executor,
+        _fake_memory_service,
+    ) = build_runtime(with_tool=True, monkeypatch=monkeypatch, tool_success=False)
+
+    asyncio.run(runtime.run("北京气温多少", "user-weather"))
+
+    assert len(SpyAgentContext.instances) == 1
+    context = SpyAgentContext.instances[0]
+    assert context.session_id == "user-weather"
+    assert context.user_input == "北京气温多少"
+    assert context.iteration_count == 2
+    assert context.current_plan is not None
+    assert [step.step_type for step in context.current_plan.steps] == [PlanStepType.LLM]
+    assert context.current_step is not None
+    assert context.current_step.step_type == PlanStepType.LLM
+    assert context.final_reply == "reply with 4 messages"
+    assert context.observation is not None
+    assert context.reflection is not None
+    assert context.reflection.status == "success"

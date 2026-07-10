@@ -17,10 +17,13 @@ ChatService
 AgentRuntime
   |
   v
+创建 AgentContext
+  |
+  v
 PlannerService 生成 Plan
   |
   v
-Executor 执行 Plan Step
+Executor 基于 AgentContext 执行 Plan Step
   |
   v
 MemoryService / ToolService / PromptService / ModelService
@@ -40,7 +43,7 @@ ReflectionService 评价本轮结果
   |   PlannerService.create_replan()
   |       |
   |       v
-  |   Executor 执行新 Plan
+  |   Executor 基于同一个 AgentContext 执行新 Plan
   |
   v
 MemoryService 保存本轮对话和长期事实
@@ -87,6 +90,7 @@ backend/
 │   ├── weather_providers/
 │   │   └── hfweather_provider.py
 │   ├── services/
+│   │   ├── agent_context.py
 │   │   ├── agent_runtime.py
 │   │   ├── chat_service.py
 │   │   ├── memory_extractor_service.py
@@ -101,7 +105,9 @@ backend/
 │       ├── __init__.py
 │       └── deepseek_provider.py
 ├── tests/
+│   ├── test_agent_context.py
 │   ├── test_agent_runtime.py
+│   ├── test_llm_executor.py
 │   ├── test_long_term_memory.py
 │   ├── test_memory_extractor_service.py
 │   ├── test_memory_executor.py
@@ -112,6 +118,7 @@ backend/
 │   ├── test_hfweather_provider.py
 │   ├── test_short_term_memory.py
 │   ├── test_tool_service.py
+│   ├── test_tool_executor.py
 │   └── test_weather_tool.py
 ├── .env.example
 ├── requirements.txt
@@ -223,7 +230,7 @@ app/services/agent_runtime.py
 - 调用 `PlannerService` 生成执行计划
 - 在最大循环次数内执行 RePlan
 - 按 Plan 调度对应 Executor
-- 维护一轮执行的 `ExecutionContext`
+- 创建并推进一轮执行的 `AgentContext`
 - 调用 `ReflectionService` 评价本轮结果
 - 保存本轮短期对话
 - 调用 `MemoryExtractorService` 提取长期事实
@@ -232,19 +239,25 @@ app/services/agent_runtime.py
 
 AgentRuntime 是 Agent 的执行协调者。它不负责制定计划，不直接执行具体 Step，也不编写 Reflection 评价规则。RePlan 时，Runtime 只负责调用 Planner 生成新 Plan 并执行，不决定新 Plan 内容。
 
+Framework V2 引入 `AgentContext` 后，Runtime 主链路不再创建旧版执行上下文。当前 Execution Layer 已完全迁移到 `AgentContext`，所有 Executor 都以它作为唯一执行上下文协议。
+
 当前 Runtime 流程：
 
 ```text
 AgentRuntime.run(message, session_id)
   |
+  |-- 创建 AgentContext(session_id, user_input)
   |-- PlannerService.plan()
+  |-- 写入 AgentContext.current_plan
   |-- MemoryStep(short_term) -> MemoryExecutor
   |-- MemoryStep(long_term)  -> MemoryExecutor
   |-- ToolStep(weather)     -> ToolExecutor
   |-- LLMStep()             -> LLMExecutor
   |-- 构建 Observation
+  |-- 写入 AgentContext.observation
   |-- ReflectionService.reflect(observation)
-  |-- 如果 failed 且未超过 max_iterations
+  |-- 写入 AgentContext.reflection
+  |-- 如果 failed、should_replan=true 且未超过 max_iterations
   |     |-- PlannerService.create_replan()
   |     |-- 执行 RePlan
   |-- MemoryService.save_conversation()
@@ -288,6 +301,62 @@ reply, debug
 ```
 
 这些信息只用于观察本轮 Agent 流程，不会写入数据库。
+
+### AgentContext
+
+文件：
+
+```text
+app/services/agent_context.py
+```
+
+职责：
+
+- 保存一次 Agent Run 的共享状态
+- 统一承载 plan、step、memory、tool、prompt、reply、observation 和 reflection 结果
+- 让 Runtime 不再维护大量零散局部变量
+- 让 Executor、Observation 和 Reflection 围绕同一个状态容器协作
+
+不负责：
+
+- 保存 Service 或 Provider 实例
+- 编写 Planner、Tool、Memory、Reflection 规则
+- 连接数据库或外部 HTTP 服务
+- 直接执行任何业务能力
+
+核心字段：
+
+```python
+AgentContext(
+    run_id="...",
+    session_id="user-a",
+    user_input="北京气温多少",
+    current_plan=Plan(...),
+    current_step=PlanStep(...),
+    step_results=[...],
+    recent_messages=[...],
+    long_term_facts=[...],
+    tool_results=[...],
+    tool_traces=[...],
+    messages=[...],
+    final_reply="...",
+    observation=Observation(...),
+    reflection=ReflectionResult(...),
+    iteration_count=1,
+    execution_errors=[],
+)
+```
+
+读写边界：
+
+- `AgentRuntime`：创建 Context，写入当前 Plan、当前 Step、循环次数、Observation 和 Reflection。
+- `PlannerService`：生成 Plan；当前仍返回 Plan，由 Runtime 写入 `current_plan`。
+- `MemoryExecutor`：读取 `session_id`，写入 `recent_messages` 和 `long_term_facts`。
+- `ToolExecutor`：读取 `user_input`，写入 `tool_results`、`tool_traces` 和工具错误。
+- `LLMExecutor`：读取用户输入、记忆和工具结果，写入 `messages` 和 `final_reply`。
+- `ReflectionService`：读取 Observation 并返回 ReflectionResult；由 Runtime 写入 Context。
+
+AgentContext 是状态容器，不是能力容器。它只保存“这一轮发生了什么”，不保存“如何执行能力”。
 
 ### PlannerService
 
@@ -445,7 +514,7 @@ app/executors/
 职责：
 
 - 执行 Planner 生成的具体 Step
-- 将执行结果写入 `ExecutionContext`
+- 将执行结果写入 `AgentContext`
 - 隔离 Runtime 和具体 Service 调用细节
 
 当前 Executor：
@@ -455,6 +524,8 @@ app/executors/
 - `LLMExecutor`：执行 `LLMStep`，内部调用 `PromptService` 和 `ModelService`
 
 Executor 不负责生成 Plan，也不负责保存对话收尾逻辑。
+
+当前 Executor 已完全基于 `AgentContext`。旧版 `ExecutionContext` 已删除，后续新增 Executor 必须遵循同一个 Context 协议。
 
 ### MemoryService
 
@@ -1023,12 +1094,22 @@ python3 -m pytest tests
 
 当前测试覆盖：
 
+- `AgentContext`
+  - 初始化时生成独立 run_id
+  - session_id 和 user_input 正确保存
+  - list 类型状态不会在不同 Context 间共享
+  - StepResult 能记录 Step 执行结果
 - `PlannerService`
   - 天气类消息会生成 `ToolStep(weather)`
   - 普通消息不会生成 ToolStep
   - 所有 Plan 都包含短期记忆、长期记忆和 LLM 步骤
   - RePlan 失败后只生成 LLMStep，不包含 ToolStep
 - `AgentRuntime`
+  - Runtime 会创建并推进 AgentContext
+  - Runtime 会把 Plan 写入 AgentContext.current_plan
+  - Runtime 会更新 AgentContext.iteration_count
+  - Executor 会通过 AgentContext 写入执行结果
+  - Observation 和 Reflection 会写回 AgentContext
   - Runtime 会根据 Plan 决定是否执行 Tool
   - Plan 中没有 ToolStep 时不会调用 Tool
   - Plan 中有 ToolStep 时会把工具结果传给 Prompt
@@ -1039,6 +1120,12 @@ python3 -m pytest tests
 - `MemoryExecutor`
   - 执行 `MemoryStep(short_term)` 后写入 recent_messages
   - 执行 `MemoryStep(long_term)` 后写入 long_term_facts
+- `ToolExecutor`
+  - 命中工具时把 ToolResult 和 ToolTrace 写入 AgentContext
+  - 工具失败时记录 execution_errors
+- `LLMExecutor`
+  - 根据 AgentContext 构建 Prompt messages
+  - 将模型回复写入 AgentContext.final_reply
 - `ReflectionService`
   - 空回复会返回 failed
   - Observation 中存在 execution_errors 时会返回 failed
@@ -1557,13 +1644,16 @@ GET /debug/memory/user-a
 - 使用 `.env` 管理 DeepSeek 配置
 - 引入 `ChatService` 作为聊天接口服务层
 - 引入 `AgentRuntime` 作为 Agent 执行协调层
+- 引入 `AgentContext` 作为一次 Agent Run 的共享状态容器
+- `AgentRuntime` 主链路已改为创建并推进 `AgentContext`
+- 旧版 `ExecutionContext` 已删除，Execution Layer 只使用 `AgentContext`
 - 引入 `PlannerService` 作为 rule-based 计划生成层
 - `PlannerService` 只生成 Plan，不调用 Tool、Memory 或 LLM
 - `PlannerService` 支持 `create_replan()`，失败后生成 LLM-only Plan
 - RePlan V1 不使用 AI Planner，不使用 LLM 做规划
 - RePlan V1 不是 Retry，失败后不会重复执行工具步骤
 - 引入 Execution Layer，由 Executor 执行 Plan Step
-- `AgentRuntime` 根据 Plan 调度 Memory、Tool 和 LLM Executor
+- `AgentRuntime` 根据 Plan 调度 Memory、Tool 和 LLM Executor，并通过 `AgentContext` 汇总执行状态
 - `AgentRuntime` 支持最多 2 次执行循环，防止 RePlan 死循环
 - 引入 `Observation` 作为 Runtime 和 Reflection 之间的数据协议
 - `AgentRuntime` 执行完成后构建 Observation
